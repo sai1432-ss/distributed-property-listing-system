@@ -1,0 +1,118 @@
+version: '3.8'
+
+services:
+  # Requirement: NGINX as the reverse proxy
+  nginx:
+    image: nginx:latest
+    container_name: nginx_proxy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      backend-us:
+        condition: service_healthy
+      backend-eu:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "service nginx status || exit 1"]
+      interval: 10s
+      retries: 3
+
+  # Requirement: Zookeeper dependency for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    # Robust health check using bash to verify the port is open
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/2181'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Requirement: Kafka as the message broker
+  kafka:
+    image: confluentinc/cp-kafka:7.0.1
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    # Check if Kafka is ready to list topics
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # Requirement: PostgreSQL instances for US and EU
+  db-us:
+    image: postgres:14
+    container_name: db_us
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: property_db_us
+    volumes:
+      - ./db-init/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d property_db_us"]
+      interval: 10s
+      retries: 5
+
+  db-eu:
+    image: postgres:14
+    container_name: db_eu
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: property_db_eu
+    volumes:
+      - ./db-init/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d property_db_eu"]
+      interval: 10s
+      retries: 5
+
+  # Requirement: Backend application services
+  backend-us:
+    build: ./backend-us
+    container_name: backend_us
+    depends_on:
+      db-us:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - REGION=us
+      - DATABASE_URL=postgresql://user:password@db-us:5432/property_db_us
+      - KAFKA_BROKER=kafka:29092
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      retries: 3
+
+  backend-eu:
+    build: ./backend-eu
+    container_name: backend_eu
+    depends_on:
+      db-eu:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - REGION=eu
+      - DATABASE_URL=postgresql://user:password@db-eu:5432/property_db_eu
+      - KAFKA_BROKER=kafka:29092
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      retries: 3
